@@ -95,8 +95,8 @@ class RulesChecker:
 
         # п:4.0 Бан-ворды: н-ворды
         self.re_n_words = re.compile(
-            r'\b(?:н+[иеeio1!|]+[гg]+[еэe]+[рr]+[а-яa-z]*|'
-            r'н+[иеeio1!|]+[гg]+[а-яa-z]*|'
+            r'\b(?:н+[иеeio1!|]+[гg]+[еэe]*[рr]+[а-яa-z]*|'
+            r'н+[иi1!|]+[гg]+[аa4@]+[а-яa-z]*|'
             r'n+[i1!|]+g+[e3a]+r+[a-z]*|'
             r'n+[i1!|]+g+[a4@]+[a-z]*)\b',
             re.IGNORECASE
@@ -115,7 +115,7 @@ class RulesChecker:
         )
 
         # п:5.0 Личная информация / Доксинг / Сливы
-        self.re_phone = re.compile(r'(?:\+?7|8)[-.\s]?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{2}[-.\s]?\d{2}\b')
+        self.re_phone = re.compile(r'(?<!\d)(?:\+?7|8)[-.\s]?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{2}[-.\s]?\d{2}(?!\d)')
         self.re_ip = re.compile(r'\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b')
         self.re_dox_threats = re.compile(
             r'\b(?:с+л+[иi]+[влть]+(?:[а-яa-z]*)|'
@@ -158,6 +158,11 @@ class RulesChecker:
             r'ц+[аa]+[хx]+[аa]+[лl])\b',
             re.IGNORECASE
         )
+        # Исключения для поп-культуры и игр (Star Wars, Marvel, Clan Wars)
+        self.re_fictional_wars = re.compile(
+            r'\b(?:звездн\w*\s+войн\w*|войн\w*\s+бесконечност\w*|войн\w*\s+клон\w*|консольн\w*\s+войн\w*|кланов\w*\s+войн\w*|войн\w*\s+и\s+мир)\b',
+            re.IGNORECASE
+        )
 
         # п:9.0 Реклама и ссылки-приглашения
         self.re_invites = re.compile(
@@ -193,7 +198,8 @@ class RulesChecker:
             r'я\s*(?:о+с+[оo0]+з+н+[аa]+л|п+[оo0]+н+[яe]+л|п+р+[оo0]+с+н+[уu]+л+[сs]+[яe])\s*(?:ч+т+[оo0]\s*)?я\s*б+[оo0]+г|'
             r'б+[оo0]+г\s*[яe]+в+[иi]+л+[сs]+[яe]|'
             r'я\s+б+[оo0]+г|'
-            r'г+[оo0]+[лl]+[дd]+[аaеоууы]|'
+            r'(?:видео|казнь|шок|жесть|картель)\s*г+[оo0]+[лl]+[дd]+[аaеоууы]|'
+            r'г+[оo0]+[лl]+[дd]+[аaеоууы]\s*(?:видео|казнь|шок|жесть|картель)|'
             r'к+[оo0]+[чch]+[аaеууы]|'
             r'п+[аa]+[нn]+[тt]+[еe]+[рr]+(?:[аaоoуые])|'
             r'с+[еe]+[рr]+[дd]+[цc]+[еe]+[еe]+[дd]+(?:[а-яa-z]*)|'
@@ -350,9 +356,15 @@ class RulesChecker:
             ))
 
         # 6. Личная информация / Доксинг / Сливы (п:5.0)
+        # Очищаем ссылки, кастомные эмодзи, упоминания и Snowflake ID (15-22 цифры), чтобы избежать ложных срабатываний
+        text_for_dox = re.sub(r'https?://\S+', '', content)
+        text_for_dox = re.sub(r'<a?:\w+:\d+>', '', text_for_dox)
+        text_for_dox = re.sub(r'<@!?\d+>|<@&\d+>|<#\d+>', '', text_for_dox)
+        text_for_dox = re.sub(r'(?<!\d)\d{15,22}(?!\d)', '', text_for_dox)
+
         match_dox = self.re_dox_threats.search(norm_content) or self.re_dox_threats.search(content) or self.re_dox_threats.search(collapsed)
-        match_phone = self.re_phone.search(content)
-        match_ip = self.re_ip.search(content)
+        match_phone = self.re_phone.search(text_for_dox)
+        match_ip = self.re_ip.search(text_for_dox)
         if match_dox or match_phone or match_ip:
             trigger = match_dox.group(0) if match_dox else (match_phone.group(0) if match_phone else match_ip.group(0))
             violations.append(RuleViolation(
@@ -438,16 +450,18 @@ class RulesChecker:
 
         # 13. Политика вне специального канала (п:8.0)
         if not is_politics_channel:
-            match_pol = self.re_politics.search(norm_content) or self.re_politics.search(content) or self.re_politics.search(collapsed)
-            if match_pol:
-                violations.append(RuleViolation(
-                    rule_code="п:8.0",
-                    rule_name="Политика вне разрешенного канала",
-                    category="Политические темы",
-                    severity="medium",
-                    matched_word=match_pol.group(0),
-                    details=f"Обсуждение политики разрешено только в канале дискуссий. Текущий канал: #{channel_name}."
-                ))
+            # Исключаем вымышленные поп-культурные войны (Star Wars, Marvel, Clan Wars)
+            if not self.re_fictional_wars.search(content):
+                match_pol = self.re_politics.search(norm_content) or self.re_politics.search(content) or self.re_politics.search(collapsed)
+                if match_pol:
+                    violations.append(RuleViolation(
+                        rule_code="п:8.0",
+                        rule_name="Политика вне разрешенного канала",
+                        category="Политические темы",
+                        severity="medium",
+                        matched_word=match_pol.group(0),
+                        details=f"Обсуждение политики разрешено только в канале дискуссий. Текущий канал: #{channel_name}."
+                    ))
 
         # 14. Спам и флуд (п:10.0 и п:16.0)
         if not is_flood_channel:
@@ -474,18 +488,18 @@ class RulesChecker:
                     details="Бессмысленный флуд повторяющимися символами."
                 ))
 
-            # Капс (> 75% заглавных букв при длине текста > 25 символов) (п:10.0)
+            # Капс (> 85% заглавных букв при длине текста >= 50 символов) (п:10.0)
             letters = [c for c in content if c.isalpha()]
-            if len(letters) >= 25:
+            if len(letters) >= 50:
                 caps = [c for c in letters if c.isupper()]
-                if len(caps) / len(letters) >= 0.75:
+                if len(caps) / len(letters) >= 0.85:
                     violations.append(RuleViolation(
                         rule_code="п:10.0",
                         rule_name="Спам и флуд",
                         category="Злоупотребление капсом",
                         severity="low",
                         matched_word="CAPSLOCK",
-                        details="Более 75% сообщения написано заглавными буквами."
+                        details="Более 85% длинного сообщения написано заглавными буквами."
                     ))
 
             # Детектор флуда повторными сообщениями (п:10.0)

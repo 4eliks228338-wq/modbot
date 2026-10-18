@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import os
+import re
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -18,10 +20,19 @@ gemini_client = None
 if GEMINI_API_KEY:
     try:
         from google import genai
+        from google.genai import types
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-        logger.info("Подключен модуль Gemini AI для глубокой проверки сообщений!")
+        logger.info("Подключен модуль Gemini AI для глубокой проверки сообщений и изображений!")
     except Exception as e:
         logger.warning(f"Не удалось инициализировать Gemini AI: {e}")
+
+# Доступные модели Gemini с автопереключением при исчерпании лимитов
+AVAILABLE_AI_MODELS = (
+    "gemini-3.1-flash-lite",
+    "gemini-3.7-flash",
+    "gemini-3.8-flash",
+    "gemini-flash-lite-latest",
+)
 
 # Инициализация проверки локальных правил
 checker = RulesChecker(
@@ -35,39 +46,40 @@ TARGET_GUILD_NAME = os.getenv("TARGET_GUILD_NAME", "all").lower()
 async def check_with_ai(content: str, channel_name: str) -> tuple[str, str] | None:
     """Проверяет сообщение через Gemini AI при наличии API-ключа.
     Возвращает (rule_code, reason) или None, если нарушений нет."""
-    if not gemini_client or not content or len(content.strip()) < 3:
+    # Короткие сообщения (<10 символов: мат, междометия, лол, хуй) не нагружают AI и не спамят ложными алертами
+    if not gemini_client or not content or len(content.strip()) < 10:
         return None
 
-    prompt = f"""Ты — строгий AI-модератор Discord-сервера "cult of browny".
-Оцени следующее сообщение участника на предмет явных или скрытых нарушений правил сервера:
+    prompt = f"""Ты — строгий AI-модератор Discord-сервера. Оцени сообщение участника на предмет РЕАЛЬНЫХ нарушений правил:
 
-Список правил сервера:
-п:2.0 Твинководство (обход ограничений, использование твинков)
-п:3.1 Прямые оскорбления, травля, грубые наезды, токсичность
-п:3.2 Провокация конфликтов, розжиг ссор
-п:3.3 Токсичное поведение, агрессия
-п:4.0 Дискриминация, разжигание ненависти, бан-ворды (п-ворды, н-ворды, шовинизм)
-п:5.0 Доксинг, деанон, сливы личных данных (сливы фото, переписок, баз данных, номеров, адресов, пробив, сваттинг)
-п:6.0 NSFW/NSFL контент (18+, порно, хентай, расчлененка, шок-контент)
-п:8.0 Политические срачи (разрешены исключительно в канале дискуссий)
+Правила сервера:
+п:3.1 Травля, целенаправленные жестокие оскорбления и унижение конкретного человека
+п:4.0 Дискриминация, расизм, нацизм (н-ворды, п-ворды, шовинизм)
+п:5.0 Доксинг, деанон, сливы личных данных (паспорта, номера телефонов, адреса, базы данных)
+п:6.0 NSFW/NSFL контент (порно, хентай, расчлененка, кровь, шок-контент)
+п:8.0 Политические срачи (разрешены только в специальном канале дискуссий)
 п:9.0 Реклама сторонних серверов/каналов (ссылки discord.gg, t.me)
-п:10.0 Спам и флуд
-п:12.0 Выдача себя за администрацию или модерацию
-п:14.0 Реальные угрозы расправой, шантаж, сваттинг, призывы к насилию
+п:14.0 Реальные угрозы расправой (сваттинг, угрозы физического насилия)
 п:15.0 Фишинг, скам, продажа аккаунтов, вредоносные ссылки
-п:16.0 Злоупотребление упоминаниями (@everyone, @here, массовые пинги)
-п:19.0 Шутки и мемы про трагедии/драмы, суициды, шок-контент, картели, расправы и стрельбу (я родился богом, родился богом, я бог, пантера, сердцеед, нинада, олешки, голда, коч, 1444, глеб кораблев, пока пацаны, ронни макнатт/mcnutt, фанкитаун/funkytown, рина паленкова/ня пока, артем исхаков/страхова, росляков, галявиев, бекмансуров, колумбайн, скулшутинг, крокус, беслан, зимняя вишня, норд-ост, башни близнецы, 3 guys 1 hammer, чикатило, пичушкин, синий кит, no mercy in mexico, сплит и любые подобные аморальные мемы)
+п:16.0 Злоупотребление упоминаниями (массовые пинги)
+п:19.0 Шутки и мемы про трагедии/суициды/массшутинг (Ронни Макнатт, 1444 Кораблёв, Галявиев, Росляков, Крокус)
+
+КРИТИЧЕСКИ ВАЖНЫЕ ИСКЛЮЧЕНИЯ (НЕ СЧИТАТЬ НАРУШЕНИЕМ):
+1. Обычный мат, ругательства, эмоциональные восклицания («нахуй», «хуй», «бля», «пиздец», «ахуели», «какое нахуй», «дилдо») и геймерский сленг НЕ ЯВЛЯЮТСЯ нарушением п:3.1! Нарушением п:3.1 считается ТОЛЬКО целенаправленная травля и жестокое унижение собеседника.
+2. Опечатки, случайный набор букв или текст в чужой раскладке (например «lhfcnt» = «здраст») НЕ ЯВЛЯЮТСЯ спамом (п:10.0)!
+3. Самоирония («ну а я даун», «я тупой») НЕ ЯВЛЯЕТСЯ дискриминацией или оскорблением!
+4. Вымышленные поп-культурные войны («Звездные войны», «Война бесконечности», клановые войны) НЕ ЯВЛЯЮТСЯ политикой (п:8.0).
 
 Канал: #{channel_name}
 Текст сообщения: "{content}"
 
-Если сообщение НАРУШАЕТ правила, ответь строго в формате:
+Если сообщение РЕАЛЬНО грубо НАРУШАЕТ правила, ответь строго в формате:
 ДА п:X.Y | Краткая причина нарушения
 
 Если сообщение НЕ нарушает правила, ответь строго одним словом:
 НЕТ"""
 
-    for model_name in ("gemini-flash-lite-latest", "gemini-3.5-flash"):
+    for model_name in AVAILABLE_AI_MODELS:
         try:
             response = await gemini_client.aio.models.generate_content(
                 model=model_name,
@@ -82,6 +94,71 @@ async def check_with_ai(content: str, channel_name: str) -> tuple[str, str] | No
             return None
         except Exception as e:
             logger.warning(f"Ошибка Gemini ({model_name}): {e}")
+    return None
+
+
+async def check_image_with_ai(image_bytes: bytes, mime_type: str, filename: str = "") -> tuple[str, str] | None:
+    """Проверяет изображение через Gemini Vision на запрещенный контент (NSFW, NSFL/шок, нацизм, доксинг, шок-мемы)."""
+    if not gemini_client or not image_bytes:
+        return None
+
+    prompt = """Ты — строгий AI-модератор Discord-сервера. Твоя задача — проверить данное изображение на запрещенный контент:
+
+Запрещенный контент:
+1. п:6.0 NSFW: Порнография, хентай, эротика, обнаженка, половые органы, сексуальные действия.
+2. п:6.0 NSFL / Шок-контент: Расчлененка, кровь, трупы, тяжелые травмы, кадры жестоких расправ, насилие (Gore).
+3. п:4.0 Нацизм и разжигание ненависти: Нацистская свастика, символика SS, нацистские флаги, пропаганда фашизма.
+4. п:5.0 Доксинг / Личные данные: Фото паспортов, водительских прав, банковских карт с реквизитами, личных документов.
+5. п:19.0 Трагедии и шок-мемы: Кадры стримов самоубийств (Ронни Макнатт / Ronnie McNutt, 1444 Глеб Кораблёв), кадры казней картелей (Funkytown, Голда, Коча, Сердцеед), фото и прославление стрелков (Галявиев, Росляков, Бекмансуров, Колумбайн).
+
+РАЗРЕШЕНО (НЕ является нарушением):
+- Обычные мемы, смешные картинки, котики, собаки, арт и аниме без обнаженки, скриншоты видеоигр.
+
+Если изображение НАРУШАЕТ правила, ответь строго в формате:
+ДА п:X.Y | Краткое описание запрещенного контента на изображении
+
+Если изображение НЕ нарушает правила, ответь строго одним словом:
+НЕТ"""
+
+    try:
+        from google.genai import types
+        part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+    except Exception as e:
+        logger.warning(f"Ошибка подготовки изображения: {e}")
+        return None
+
+    for model_name in AVAILABLE_AI_MODELS:
+        try:
+            response = await gemini_client.aio.models.generate_content(
+                model=model_name,
+                contents=[part, prompt]
+            )
+            text = response.text.strip()
+            if text.upper().startswith("ДА"):
+                parts = text.split("|", 1)
+                code_part = parts[0].replace("ДА", "").strip()
+                reason = parts[1].strip() if len(parts) > 1 else "Запрещенный контент на изображении"
+                return (code_part, reason)
+            return None
+        except Exception as e:
+            logger.warning(f"Ошибка Gemini Vision ({model_name}): {e}")
+    return None
+
+
+async def fetch_image(url: str) -> tuple[bytes, str] | None:
+    """Безопасно скачивает изображение по URL (до 10 МБ)."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    c_type = resp.headers.get("Content-Type", "")
+                    if "image" in c_type:
+                        data = await resp.read()
+                        if len(data) <= 10 * 1024 * 1024:
+                            return data, c_type.split(";")[0].strip()
+    except Exception as e:
+        logger.debug(f"Не удалось загрузить изображение по URL {url}: {e}")
     return None
 
 
@@ -196,7 +273,44 @@ def create_bot(with_message_content: bool = True) -> commands.Bot:
             await send_violation_alert(message, verdict=verdict, details=top_v.details, trigger=top_v.matched_word, is_ai=False)
             return
 
-        # 2. Если локальные регулярки не сработали, но подключен Gemini AI - проверяем контекст через AI
+        # 2. Проверка вложений-изображений через Gemini Vision
+        if gemini_client and message.attachments:
+            for att in message.attachments[:3]:
+                ext = os.path.splitext(att.filename)[1].lower()
+                is_img = (att.content_type and att.content_type.startswith("image/")) or ext in ('.png', '.jpg', '.jpeg', '.webp', '.gif')
+                if is_img and att.size <= 10 * 1024 * 1024:
+                    try:
+                        img_bytes = await att.read()
+                        mime = att.content_type or (f"image/{ext.replace('.', '')}" if ext else "image/png")
+                        img_res = await check_image_with_ai(img_bytes, mime, att.filename)
+                        if img_res:
+                            code, reason = img_res
+                            verdict = f"ДА {code} (ИИ)"
+                            logger.info(f"[{message.guild.name}][#{message.channel.name}] AI Vision обнаружил нарушение во вложении {att.filename}: {verdict}")
+                            await send_violation_alert(message, verdict=verdict, details=reason, trigger=att.filename, is_ai=True)
+                            return
+                    except Exception as e:
+                        logger.warning(f"Ошибка проверки вложения {att.filename}: {e}")
+
+        # 3. Проверка прямых ссылок на изображения через Gemini Vision
+        if gemini_client and message.content:
+            urls = re.findall(r'https?://\S+', message.content)
+            for url in urls[:2]:
+                url_clean = url.split("?")[0].lower()
+                if any(url_clean.endswith(ext) for ext in ('.png', '.jpg', '.jpeg', '.webp', '.gif')) or "cdn.discordapp.com/attachments/" in url.lower():
+                    img_data = await fetch_image(url)
+                    if img_data:
+                        img_bytes, mime = img_data
+                        fname = url.split("/")[-1].split("?")[0]
+                        img_res = await check_image_with_ai(img_bytes, mime, fname)
+                        if img_res:
+                            code, reason = img_res
+                            verdict = f"ДА {code} (ИИ)"
+                            logger.info(f"[{message.guild.name}][#{message.channel.name}] AI Vision обнаружил нарушение по ссылке {url}: {verdict}")
+                            await send_violation_alert(message, verdict=verdict, details=reason, trigger=fname, is_ai=True)
+                            return
+
+        # 4. Если локальные регулярки не сработали, но подключен Gemini AI - проверяем контекст текста через AI
         if gemini_client and message.content:
             ai_res = await check_with_ai(message.content, getattr(message.channel, "name", "чат"))
             if ai_res:
@@ -204,6 +318,7 @@ def create_bot(with_message_content: bool = True) -> commands.Bot:
                 verdict = f"ДА {code} (ИИ)"
                 logger.info(f"[{message.guild.name}][#{message.channel.name}] AI обнаружил нарушение от {message.author}: {verdict}")
                 await send_violation_alert(message, verdict=verdict, details=reason, trigger="", is_ai=True)
+                return
 
         await b.process_commands(message)
 
@@ -248,6 +363,33 @@ def create_bot(with_message_content: bool = True) -> commands.Bot:
                 view.add_item(discord.ui.Button(label="Перейти к сообщению", url=message.jump_url, style=discord.ButtonStyle.link))
             await interaction.followup.send(embed=embed, view=view, ephemeral=True)
             return
+
+        if gemini_client and message.attachments:
+            for att in message.attachments[:3]:
+                ext = os.path.splitext(att.filename)[1].lower()
+                is_img = (att.content_type and att.content_type.startswith("image/")) or ext in ('.png', '.jpg', '.jpeg', '.webp', '.gif')
+                if is_img and att.size <= 10 * 1024 * 1024:
+                    try:
+                        img_bytes = await att.read()
+                        mime = att.content_type or (f"image/{ext.replace('.', '')}" if ext else "image/png")
+                        img_res = await check_image_with_ai(img_bytes, mime, att.filename)
+                        if img_res:
+                            code, reason = img_res
+                            verdict = f"ДА {code} (ИИ)"
+                            embed = discord.Embed(title=f"Нарушение: {verdict}", color=0x2B2D31)
+                            embed.add_field(name="Откуда:", value=f"{guild_name} • #{ch_name}", inline=False)
+                            embed.add_field(name="Автор", value=f"{message.author.mention}\nЮз: @{message.author.name}\nНик: {message.author.display_name}\nID: {message.author.id}", inline=True)
+                            embed.add_field(name="Триггер", value=f"`{att.filename}`", inline=True)
+                            embed.add_field(name="Почему", value=reason, inline=False)
+                            clean = message.content or "[без текста / вложение]"
+                            embed.add_field(name="Сообщение", value=f"```{clean[:800]}```", inline=False)
+                            view = discord.ui.View()
+                            if message.jump_url:
+                                view.add_item(discord.ui.Button(label="Перейти к сообщению", url=message.jump_url, style=discord.ButtonStyle.link))
+                            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+                            return
+                    except Exception as e:
+                        logger.warning(f"Ошибка проверки вложения в контекстном меню: {e}")
 
         if gemini_client and message.content:
             ai_res = await check_with_ai(message.content, ch_name)
