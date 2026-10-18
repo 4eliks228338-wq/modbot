@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 import aiohttp
 import discord
 from discord import app_commands
@@ -26,13 +27,38 @@ if GEMINI_API_KEY:
     except Exception as e:
         logger.warning(f"Не удалось инициализировать Gemini AI: {e}")
 
-# Доступные модели Gemini с автопереключением при исчерпании лимитов
+# Доступные модели Gemini с автоматическим переключением при исчерпании лимитов
 AVAILABLE_AI_MODELS = (
     "gemini-3.1-flash-lite",
-    "gemini-3.7-flash",
     "gemini-3.8-flash",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3-flash-preview",
+    "gemini-3.7-flash",
     "gemini-flash-lite-latest",
+    "gemini-flash-latest",
 )
+
+# Словарь временно заблокированных моделей из-за 429 квоты (модель -> timestamp разблокировки)
+EXHAUSTED_MODELS: dict[str, float] = {}
+
+
+def get_active_models() -> list[str]:
+    """Возвращает список моделей с неисчерпанным лимитом квот."""
+    now = time.time()
+    return [m for m in AVAILABLE_AI_MODELS if now >= EXHAUSTED_MODELS.get(m, 0)]
+
+
+def mark_model_exhausted(model_name: str, cooldown_seconds: float = 1800.0):
+    """Фиксирует исчерпание лимита у модели и переключает на следующую."""
+    EXHAUSTED_MODELS[model_name] = time.time() + cooldown_seconds
+    active = get_active_models()
+    next_model = active[0] if active else "НЕТ (все квоты исчерпаны)"
+    mins = int(cooldown_seconds // 60)
+    logger.warning(
+        f"Модель '{model_name}' исчерпала квоту (429 RESOURCE_EXHAUSTED). "
+        f"Заморожена на {mins} мин. Автоматический переход на модель: '{next_model}'."
+    )
+
 
 # Инициализация проверки локальных правил
 checker = RulesChecker(
@@ -46,8 +72,16 @@ TARGET_GUILD_NAME = os.getenv("TARGET_GUILD_NAME", "all").lower()
 async def check_with_ai(content: str, channel_name: str) -> tuple[str, str] | None:
     """Проверяет сообщение через Gemini AI при наличии API-ключа.
     Возвращает (rule_code, reason) или None, если нарушений нет."""
-    # Короткие сообщения (<10 символов: мат, междометия, лол, хуй) не нагружают AI и не спамят ложными алертами
-    if not gemini_client or not content or len(content.strip()) < 10:
+    if not gemini_client or not content:
+        return None
+
+    stripped = content.strip()
+    # Пропускаем короткие бытовые фразы без ссылок и упоминаний (<15 символов), чтобы экономить квоты
+    if len(stripped) < 15 and "<@" not in stripped and "http" not in stripped:
+        return None
+
+    active_models = get_active_models()
+    if not active_models:
         return None
 
     prompt = f"""Ты — строгий AI-модератор Discord-сервера. Оцени сообщение участника на предмет РЕАЛЬНЫХ нарушений правил:
@@ -79,7 +113,7 @@ async def check_with_ai(content: str, channel_name: str) -> tuple[str, str] | No
 Если сообщение НЕ нарушает правила, ответь строго одним словом:
 НЕТ"""
 
-    for model_name in AVAILABLE_AI_MODELS:
+    for model_name in active_models:
         try:
             response = await gemini_client.aio.models.generate_content(
                 model=model_name,
@@ -93,13 +127,27 @@ async def check_with_ai(content: str, channel_name: str) -> tuple[str, str] | No
                 return (code_part, reason)
             return None
         except Exception as e:
-            logger.warning(f"Ошибка Gemini ({model_name}): {e}")
+            err_str = str(e)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                delay_match = re.search(r"retryDelay': '(\d+)s'", err_str)
+                delay = float(delay_match.group(1)) if delay_match else 3600.0
+                mark_model_exhausted(model_name, delay)
+                continue
+            elif "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str.lower():
+                mark_model_exhausted(model_name, 300.0)
+                continue
+            else:
+                logger.warning(f"Ошибка Gemini ({model_name}): {err_str[:120]}")
     return None
 
 
 async def check_image_with_ai(image_bytes: bytes, mime_type: str, filename: str = "") -> tuple[str, str] | None:
     """Проверяет изображение через Gemini Vision на запрещенный контент (NSFW, NSFL/шок, нацизм, доксинг, шок-мемы)."""
     if not gemini_client or not image_bytes:
+        return None
+
+    active_models = get_active_models()
+    if not active_models:
         return None
 
     prompt = """Ты — строгий AI-модератор Discord-сервера. Твоя задача — проверить данное изображение на запрещенный контент:
@@ -127,7 +175,7 @@ async def check_image_with_ai(image_bytes: bytes, mime_type: str, filename: str 
         logger.warning(f"Ошибка подготовки изображения: {e}")
         return None
 
-    for model_name in AVAILABLE_AI_MODELS:
+    for model_name in active_models:
         try:
             response = await gemini_client.aio.models.generate_content(
                 model=model_name,
@@ -141,7 +189,17 @@ async def check_image_with_ai(image_bytes: bytes, mime_type: str, filename: str 
                 return (code_part, reason)
             return None
         except Exception as e:
-            logger.warning(f"Ошибка Gemini Vision ({model_name}): {e}")
+            err_str = str(e)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                delay_match = re.search(r"retryDelay': '(\d+)s'", err_str)
+                delay = float(delay_match.group(1)) if delay_match else 3600.0
+                mark_model_exhausted(model_name, delay)
+                continue
+            elif "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str.lower():
+                mark_model_exhausted(model_name, 300.0)
+                continue
+            else:
+                logger.warning(f"Ошибка Gemini Vision ({model_name}): {err_str[:120]}")
     return None
 
 
@@ -253,7 +311,8 @@ def create_bot(with_message_content: bool = True) -> commands.Bot:
 
         # Логируем входящее сообщение
         if not message.content:
-            logger.warning(f"[{message.guild.name}][#{message.channel.name}] Сообщение от {message.author} пришло с ПУСТЫМ текстом! Причина: тумблер 'Message Content Intent' выключен в Discord Developer Portal.")
+            if not message.attachments and not getattr(message, "stickers", None):
+                logger.warning(f"[{message.guild.name}][#{message.channel.name}] Сообщение от {message.author} пришло с ПУСТЫМ текстом! Причина: тумблер 'Message Content Intent' выключен в Discord Developer Portal.")
         else:
             logger.info(f"[{message.guild.name}][#{message.channel.name}] Получено сообщение от {message.author}: '{message.content}'")
 
